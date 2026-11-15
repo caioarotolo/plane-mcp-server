@@ -90,6 +90,17 @@ def test_identity_keys_include_issuer_and_subject():
         identity_key({"sub": "u"})
 
 
+def test_authentik_refresh_retains_offline_access_with_narrowed_scopes():
+    proxy = object.__new__(CommunityOIDCProxy)
+    requested = ["openid"]
+    assert proxy._prepare_scopes_for_upstream_refresh(requested) == ["offline_access", "openid"]
+    assert requested == ["openid"]
+    assert proxy._prepare_scopes_for_upstream_refresh(["openid", "offline_access"]) == [
+        "offline_access",
+        "openid",
+    ]
+
+
 def test_oauth_bindings_are_isolated_and_do_not_change_issued_tokens():
     async def scenario():
         vault = make_vault()

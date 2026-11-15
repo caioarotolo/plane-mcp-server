@@ -13,6 +13,8 @@ tools without patching their client or middleware.
 
 - FastMCP `OIDCProxy` owns MCP OAuth 2.1, PKCE S256, discovery, DCR/CIMD,
   consent, encrypted upstream tokens, refresh and revocation.
+  The adapter retains Authentik's required `offline_access` scope on refresh,
+  including when a client requests only `openid`.
 - Authentik authenticates users with OIDC. Use RS256, a signing key, explicit
   redirect URIs, 10-minute access/ID tokens, rotating refresh tokens and a
   restricted application group. Enable passkeys/MFA in its authentication flow.
@@ -102,7 +104,7 @@ to synchronize the customized main branch.
 
 ## Validation and rollback
 
-`uv sync --frozen --extra dev && uv run --frozen pytest -q` runs upstream tests and
+`uv sync --frozen --extra dev && uv run --frozen --extra dev pytest -q` runs upstream tests and
 adapter security/compatibility tests. Before promotion, exercise real OAuth with
 two separate users, wrong/missing PKCE, refresh, unlink/revocation, persistence,
 and legacy PAT clients. Keep the previous MCP container/config available and

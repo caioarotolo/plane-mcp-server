@@ -15,6 +15,11 @@ PAT_PATTERN = re.compile(r"plane_api_[0-9a-f]{32}")
 
 
 class CommunityOIDCProxy(OIDCProxy):
+    def _prepare_scopes_for_upstream_refresh(self, scopes):
+        # Authentik requires offline_access even when a client narrows its
+        # refresh request to openid. It was granted on the initial login.
+        return sorted(set(scopes) | {"offline_access"})
+
     def _decode_list_cookie(self, request, base_name):
         # Same upstream fix as PlaneOAuthProvider: a declined attempt must not
         # prevent the person from consenting on a later attempt.
