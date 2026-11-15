@@ -1,0 +1,63 @@
+name: plane-mcp-oauth
+services:
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: [sh, -c, 'exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"']
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?required}
+    volumes:
+      - redis-data:/data
+    mem_limit: 192m
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+  http:
+    image: ${MCP_IMAGE:?pin the built image}
+    restart: unless-stopped
+    init: true
+    user: "1001:1001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: ["/tmp:rw,nosuid,nodev,size=64m"]
+    mem_limit: 512m
+    pids_limit: 128
+    environment:
+      COMMUNITY_PUBLIC_URL: ${COMMUNITY_PUBLIC_URL:?required}
+      COMMUNITY_OIDC_DISCOVERY_URL: ${COMMUNITY_OIDC_DISCOVERY_URL:?required}
+      COMMUNITY_OIDC_CLIENT_ID: ${COMMUNITY_OIDC_CLIENT_ID:?required}
+      COMMUNITY_OIDC_CLIENT_SECRET: ${COMMUNITY_OIDC_CLIENT_SECRET:?required}
+      COMMUNITY_ENCRYPTION_KEY: ${COMMUNITY_ENCRYPTION_KEY:?required}
+      COMMUNITY_SIGNING_KEY: ${COMMUNITY_SIGNING_KEY:?required}
+      MCP_DEFAULT_WORKSPACE_SLUG: ${MCP_DEFAULT_WORKSPACE_SLUG:?required}
+      PLANE_BASE_URL: ${PLANE_BASE_URL:?required}
+      PLANE_INTERNAL_BASE_URL: ${PLANE_INTERNAL_BASE_URL:?required}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      LOG_PAYLOADS: "false"
+      LOG_USER_INFO: "false"
+      HOME: /tmp
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      default:
+      plane:
+        aliases: [plane-mcp-oauth]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; assert urllib.request.urlopen('http://127.0.0.1:8211/.well-known/oauth-authorization-server',timeout=3).status==200"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+volumes:
+  redis-data:
+networks:
+  plane:
+    external: true
+    name: plane_default
