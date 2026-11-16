@@ -1,82 +1,94 @@
-"""Adapt verified identities to upstream's existing per-request API-key context."""
+"""Keep direct PAT clients and the official per-request Plane context unchanged."""
 
+import os
 import re
 
-from fastmcp.server.auth import MultiAuth
-from fastmcp.server.auth.oidc_proxy import OIDCProxy
-from fastmcp.server.dependencies import get_access_token
-from fastmcp.server.middleware import Middleware
-from fastmcp.tools.tool import ToolResult
+import httpx
 
 from plane_mcp.auth.plane_header_auth_provider import PlaneHeaderAuthProvider
-from plane_mcp.community.store import Vault, identity_key
 
 PAT_PATTERN = re.compile(r"plane_api_[0-9a-f]{32}")
 
 
-class CommunityOIDCProxy(OIDCProxy):
-    def _prepare_scopes_for_upstream_refresh(self, scopes):
-        # Authentik requires offline_access even when a client narrows its
-        # refresh request to openid. It was granted on the initial login.
-        return sorted(set(scopes) | {"offline_access"})
-
-    def _decode_list_cookie(self, request, base_name):
-        # Same upstream fix as PlaneOAuthProvider: a declined attempt must not
-        # prevent the person from consenting on a later attempt.
-        if base_name == "MCP_DENIED_CLIENTS":
-            return []
-        return super()._decode_list_cookie(request, base_name)
+async def validate_pat(pat, workspace):
+    if not PAT_PATTERN.fullmatch(pat):
+        return None
+    base = (os.getenv("PLANE_INTERNAL_BASE_URL") or os.environ["PLANE_BASE_URL"]).rstrip("/")
+    async with httpx.AsyncClient(timeout=10, trust_env=False, follow_redirects=False) as client:
+        me = await client.get(base + "/api/v1/users/me/", headers={"X-Api-Key": pat})
+        if me.status_code != 200 or not me.json().get("id"):
+            return None
+        access = await client.get(base + f"/api/v1/workspaces/{workspace}/projects/", headers={"X-Api-Key": pat})
+        if access.status_code != 200:
+            return None
+    return {"pat": pat, "user_id": str(me.json()["id"]), "email": str(me.json().get("email", ""))}
 
 
 class PersonalTokenVerifier(PlaneHeaderAuthProvider):
     async def verify_token(self, token):
-        # Never forward OAuth JWTs or arbitrary credentials to the Plane API.
         if not PAT_PATTERN.fullmatch(token):
             return None
         return await super().verify_token(token)
 
 
-class CommunityAuth(MultiAuth):
-    def __init__(self, *, server, vault: Vault, workspace: str):
-        super().__init__(server=server, verifiers=[PersonalTokenVerifier()], required_scopes=[])
-        self.vault = vault
-        self.workspace = workspace
+class AuthGuard:
+    """Small global abuse budgets for auth routes; MCP calls are unaffected."""
 
-    async def verify_token(self, token):
-        verified = await super().verify_token(token)
-        if verified is None or verified.claims.get("auth_method") == "api_key_header":
-            return verified
-        subject = identity_key(verified.claims)
-        binding = await self.vault.get("binding", subject)
-        claims = {
-            "auth_method": "api_key_header" if binding else "community_unlinked",
-            "workspace_slug": self.workspace,
-            "community_subject": subject,
-            "plane_user_id": binding["user_id"] if binding else None,
-        }
-        # This copy lives only inside the authenticated request. OAuth issuance,
-        # refresh and revocation remain owned by OIDCProxy; PATs never go to clients.
-        return verified.model_copy(update={"token": binding["pat"] if binding else "", "claims": claims})
+    LIMITS = {
+        "/register": (60, 3600),
+        "/authorize": (120, 60),
+        "/mcp/authorize": (120, 60),
+        "/token": (300, 60),
+        "/revoke": (300, 60),
+    }
 
+    def __init__(self, app, redis):
+        self.app, self.redis = app, redis
 
-class RequireBinding(Middleware):
-    async def on_call_tool(self, context, call_next):
-        token = get_access_token()
-        if token and token.claims.get("auth_method") == "community_unlinked" and context.message.name != "identity":
-            return ToolResult(content="Link your Plane account first: call identity to get the secure account page.")
-        return await call_next(context)
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] in self.LIMITS:
+            from starlette.responses import Response
+
+            limit, seconds = self.LIMITS[scope["path"]]
+            async with self.redis.pipeline() as pipe:
+                key = "community-direct:rate:" + scope["path"]
+                pipe.incr(key)
+                pipe.expire(key, seconds, nx=True)
+                count, _ = await pipe.execute()
+            if count > limit:
+                return await Response(status_code=429, headers={"Retry-After": str(seconds)})(scope, receive, send)
+            body = b""
+            while True:
+                chunk = await receive()
+                if chunk["type"] == "http.disconnect":
+                    return
+                body += chunk.get("body", b"")
+                if len(body) > 32768:
+                    return await Response(status_code=413)(scope, receive, send)
+                if not chunk.get("more_body", False):
+                    break
+            original_receive = receive
+            sent = False
+
+            async def buffered_receive():
+                nonlocal sent
+                if not sent:
+                    sent = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return await original_receive()
+
+            receive = buffered_receive
+        await self.app(scope, receive, send)
 
 
 class LegacyHeaders:
-    """Keep the deployed PAT-only clients compatible on the same /mcp URL."""
-
-    def __init__(self, app, workspace: str):
+    def __init__(self, app, workspace):
         self.app, self.workspace = app, workspace
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and scope["path"] == "/mcp":
             headers = list(scope["headers"])
-            auth = [value for key, value in headers if key.lower() == b"authorization"]
+            auth = [v for k, v in headers if k.lower() == b"authorization"]
             if len(auth) > 1:
                 from starlette.responses import Response
 

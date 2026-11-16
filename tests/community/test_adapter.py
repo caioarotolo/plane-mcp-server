@@ -1,291 +1,392 @@
-"""Security boundaries and backward compatibility of the optional adapter."""
+"""Exercise the real SDK OAuth handlers and the adapter's security boundaries."""
 
 import asyncio
+import base64
+import hashlib
+import json
+import re
+import secrets
 import time
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
 
-import jwt
+import httpx
 import pytest
 from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from fakeredis.aioredis import FakeRedis
-from fastmcp.server.auth.auth import AccessToken, TokenVerifier
-from fastmcp.server.auth.oidc_proxy import OIDCConfiguration
-from fastmcp.server.auth.providers.jwt import JWTVerifier
-from key_value.aio.stores.memory import MemoryStore
-from starlette.applications import Starlette
+from fastmcp.server.dependencies import get_access_token
 from starlette.testclient import TestClient
 
-from plane_mcp.community.auth import CommunityAuth, CommunityOIDCProxy, RequireBinding
-from plane_mcp.community.portal import COOKIE, AccountPortal
+from plane_mcp.community.auth import validate_pat
+from plane_mcp.community.oauth import DirectOAuth
 from plane_mcp.community.settings import Settings
-from plane_mcp.community.store import Vault, identity_key
+from plane_mcp.community.store import Vault
 
 ORIGIN = "https://planner.example.com"
-ISSUER = "https://login.example.com/application/o/plane/"
-PAT = "plane_api_" + "a" * 32
-SETTINGS = Settings(
-    origin=ORIGIN,
-    discovery_url=ISSUER + ".well-known/openid-configuration",
-    client_id="plane-client",
-    client_secret="secret-for-tests-only",
-    encryption_key=Fernet.generate_key().decode(),
-    signing_key="test-signing-key-" * 4,
-    redis_url="redis://localhost:6379/0",
-    workspace="openmarkets",
-)
-OIDC = OIDCConfiguration(
-    issuer=ISSUER,
-    authorization_endpoint=ISSUER + "authorize/",
-    token_endpoint=ISSUER + "token/",
-    jwks_uri=ISSUER + "jwks/",
-    response_types_supported=["code"],
-    subject_types_supported=["public"],
-    id_token_signing_alg_values_supported=["RS256"],
-)
+CALLBACK = "http://127.0.0.1:8765/callback"
+PATS = ["plane_api_" + "a" * 32, "plane_api_" + "b" * 32]
+SETTINGS = Settings(ORIGIN, Fernet.generate_key().decode(), "redis://localhost", "openmarkets")
 
 
-def run(coro):
-    return asyncio.run(coro)
+@pytest.fixture
+def env(monkeypatch):
+    from plane_mcp.community import __main__ as entry
+
+    redis = FakeRedis()
+    vault = Vault(redis, SETTINGS.encryption_key)
+    provider = DirectOAuth(SETTINGS, vault)
+    users = {pat: {"pat": pat, "user_id": str(i), "email": f"user{i}@example.invalid"} for i, pat in enumerate(PATS)}
+    check = AsyncMock(side_effect=lambda pat, workspace: users.get(pat))
+    monkeypatch.setattr("plane_mcp.community.portal.validate_pat", check)
+    monkeypatch.setattr("plane_mcp.community.oauth.validate_pat", check)
+    monkeypatch.setattr(entry.Redis, "from_url", lambda *a, **kw: redis)
+    monkeypatch.setattr(entry, "DirectOAuth", lambda *a: provider)
+    monkeypatch.setattr(
+        "plane_mcp.auth.plane_header_auth_provider.PlaneHeaderAuthProvider._validate_api_key",
+        AsyncMock(side_effect=lambda pat: pat in users),
+    )
+    original = entry.get_header_mcp
+
+    def factory():
+        server = original()
+
+        @server.tool
+        def probe():
+            token = get_access_token()
+            assert token.token == PATS[int(token.claims["plane_user_id"])]
+            return {"user": token.claims["plane_user_id"], "workspace": token.claims["workspace_slug"]}
+
+        return server
+
+    monkeypatch.setattr(entry, "get_header_mcp", factory)
+    app = entry.build_app(SETTINGS)
+    with TestClient(app, base_url=ORIGIN) as client:
+        yield client, provider, users, app
 
 
-def make_vault():
-    return Vault(FakeRedis(), SETTINGS.encryption_key)
+def register(client, **extra):
+    r = client.post(
+        "/register",
+        json={
+            "client_name": "Test client",
+            "redirect_uris": [CALLBACK],
+            "token_endpoint_auth_method": "none",
+            "grant_types": ["authorization_code", "refresh_token"],
+            **extra,
+        },
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
 
 
-def token(user="one", issuer=ISSUER):
-    return AccessToken(
-        token="oauth-jwt-" + user,
-        client_id="client",
-        scopes=["openid"],
-        expires_at=int(time.time()) + 600,
-        claims={"iss": issuer, "sub": user},
+def begin(client, registration, **changes):
+    verifier = secrets.token_urlsafe(32)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+    params = {
+        "client_id": registration["client_id"],
+        "response_type": "code",
+        "redirect_uri": CALLBACK,
+        "scope": "plane",
+        "state": "client-state",
+        "resource": SETTINGS.resource,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+        **changes,
+    }
+    r = client.get("/authorize", params=params, follow_redirects=False)
+    return r, verifier
+
+
+def consent(client, registration, pat=PATS[0]):
+    r, verifier = begin(client, registration)
+    assert r.status_code == 302
+    url = r.headers["location"]
+    page = client.get(url)
+    csrf = re.search('name="csrf" value="([^"]+)"', page.text).group(1)
+    r = client.post(
+        url, data={"csrf": csrf, "pat": pat, "action": "allow"}, headers={"Origin": ORIGIN}, follow_redirects=False
+    )
+    assert r.status_code == 303, r.text
+    assert pat not in r.text and pat not in r.headers["location"]
+    query = parse_qs(urlsplit(r.headers["location"]).query)
+    assert query["state"] == ["client-state"]
+    return {
+        "grant_type": "authorization_code",
+        "client_id": registration["client_id"],
+        "code": query["code"][0],
+        "code_verifier": verifier,
+        "redirect_uri": CALLBACK,
+        "resource": SETTINGS.resource,
+    }
+
+
+def tokens(client, registration, pat=PATS[0]):
+    r = client.post("/token", data=consent(client, registration, pat))
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def refresh(client, registration, token, **extra):
+    return client.post(
+        "/token",
+        data={
+            "grant_type": "refresh_token",
+            "client_id": registration["client_id"],
+            "refresh_token": token,
+            "resource": SETTINGS.resource,
+            **extra,
+        },
     )
 
 
-def test_vault_encrypts_pats_and_consumes_state_atomically():
-    async def scenario():
-        vault = make_vault()
-        await vault.put("binding", "one", {"pat": PAT, "user_id": "1"})
-        raw = await vault.redis.get("community:binding:one")
-        assert PAT.encode() not in raw
-        assert (await vault.get("binding", "one"))["pat"] == PAT
-        await vault.put("login", "nonce", {"verifier": "secret"}, 600)
-        assert 0 < await vault.redis.ttl("community:login:nonce") <= 600
-        results = await asyncio.gather(*(vault.get("login", "nonce", consume=True) for _ in range(5)))
-        assert sum(item is not None for item in results) == 1
-        await vault.delete("binding", "one")
-        assert await vault.get("binding", "one") is None
-
-    run(scenario())
+def rpc(client, token, method="tools/call", params=None, **headers):
+    if params is None:
+        params = {"name": "probe", "arguments": {}}
+    r = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer " + token, "Accept": "application/json, text/event-stream", **headers},
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+    )
+    return r
 
 
-def test_identity_keys_include_issuer_and_subject():
-    assert identity_key({"iss": "a", "sub": "bc"}) != identity_key({"iss": "ab", "sub": "c"})
-    assert identity_key({"iss": "a", "sub": "u"}) != identity_key({"iss": "b", "sub": "u"})
-    with pytest.raises(ValueError):
-        identity_key({"sub": "u"})
+def result(response):
+    assert response.status_code == 200, response.text
+    raw = (
+        response.json()
+        if "application/json" in response.headers["content-type"]
+        else json.loads(next(x[5:].strip() for x in response.text.splitlines() if x.startswith("data:")))
+    )
+    return raw["result"]["structuredContent"]
 
 
-def test_authentik_refresh_retains_offline_access_with_narrowed_scopes():
-    proxy = object.__new__(CommunityOIDCProxy)
-    requested = ["openid"]
-    assert proxy._prepare_scopes_for_upstream_refresh(requested) == ["offline_access", "openid"]
-    assert requested == ["openid"]
-    assert proxy._prepare_scopes_for_upstream_refresh(["openid", "offline_access"]) == [
-        "offline_access",
-        "openid",
-    ]
+def test_discovery_redirects_pkce_and_resource_restrictions(env):
+    c, p, _, _ = env
+    meta = c.get("/.well-known/oauth-authorization-server").json()
+    assert meta["code_challenge_methods_supported"] == ["S256"] and meta["client_id_metadata_document_supported"]
+    assert "none" in meta["token_endpoint_auth_methods_supported"]
+    assert c.get("/.well-known/oauth-protected-resource/mcp").json()["resource"] == SETTINGS.resource
+    for uri in ["https://attacker.invalid/callback", "http://localhost@attacker.invalid/callback"]:
+        assert c.post("/register", json={"redirect_uris": [uri]}).status_code == 400
+    reg = register(c)
+    for changes in [
+        {"code_challenge": None},
+        {"code_challenge_method": "plain"},
+        {"resource": "https://attacker.invalid/mcp"},
+        {"redirect_uri": "https://attacker.invalid/callback"},
+    ]:
+        r, _ = begin(c, reg, **changes)
+        assert r.status_code == 400 or "error=" in r.headers.get("location", "")
+    form = consent(c, reg)
+    assert c.post("/token", data=form | {"code_verifier": "wrong"}).status_code == 401
+    assert c.post("/token", data=form | {"resource": "https://other.invalid/mcp"}).status_code == 400
+    assert c.post("/token", data=form | {"redirect_uri": CALLBACK + "/other"}).status_code == 400
+    assert c.post("/token", data=form).status_code == 200
+    assert c.post("/token", data=form).status_code == 401
 
 
-def test_oauth_bindings_are_isolated_and_do_not_change_issued_tokens():
-    async def scenario():
-        vault = make_vault()
-        one, two = token("one"), token("two")
-        provider = TokenVerifier()
-        provider.verify_token = AsyncMock(side_effect=lambda raw: {"one": one, "two": two}.get(raw))
-        auth = CommunityAuth(server=provider, vault=vault, workspace="openmarkets")
-        await vault.put("binding", identity_key(one.claims), {"pat": PAT, "user_id": "plane-one"})
-        first, second = await asyncio.gather(auth.verify_token("one"), auth.verify_token("two"))
-        assert first.token == PAT and first.claims["plane_user_id"] == "plane-one"
-        assert second.token == "" and second.claims["auth_method"] == "community_unlinked"
-        assert one.token == "oauth-jwt-one" and "community_subject" not in one.claims
-        from plane_mcp.client import get_plane_client_context
-
-        with (
-            patch("plane_mcp.client.get_access_token", return_value=first),
-            patch("plane_mcp.client.PlaneClient") as sdk,
-        ):
-            get_plane_client_context()
-            assert sdk.call_args.kwargs["api_key"] == PAT
-            assert "access_token" not in sdk.call_args.kwargs
-        await vault.delete("binding", identity_key(one.claims))
-        assert (await auth.verify_token("one")).claims["auth_method"] == "community_unlinked"
-
-    run(scenario())
-
-
-def test_unbound_user_cannot_call_plane_tools():
-    async def scenario():
-        unbound = token().model_copy(update={"claims": {"auth_method": "community_unlinked"}})
-        next_call = AsyncMock(return_value="called")
-        with patch("plane_mcp.community.auth.get_access_token", return_value=unbound):
-            ctx = SimpleNamespace(message=SimpleNamespace(name="project"))
-            await RequireBinding().on_call_tool(ctx, next_call)
-            next_call.assert_not_awaited()
-            ctx.message.name = "identity"
-            assert await RequireBinding().on_call_tool(ctx, next_call) == "called"
-
-    run(scenario())
+def test_consent_csrf_cookie_origin_and_denial(env):
+    c, _, _, _ = env
+    reg = register(c)
+    r, _ = begin(c, reg)
+    url = r.headers["location"]
+    page = c.get(url)
+    assert "Secure" in page.headers["set-cookie"] and "HttpOnly" in page.headers["set-cookie"]
+    assert (
+        page.headers["cache-control"] == "no-store"
+        and "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    )
+    csrf = re.search('name="csrf" value="([^"]+)"', page.text).group(1)
+    for headers, body in [
+        ({"Origin": "https://other.invalid"}, {"csrf": csrf}),
+        ({"Origin": ORIGIN}, {"csrf": "wrong"}),
+    ]:
+        assert c.post(url, headers=headers, data=body | {"pat": PATS[0]}).status_code == 403
+    cookies = list(c.cookies.jar)
+    c.cookies.clear()
+    assert c.post(url, headers={"Origin": ORIGIN}, data={"csrf": csrf, "pat": PATS[0]}).status_code == 403
+    for cookie in cookies:
+        c.cookies.jar.set_cookie(cookie)
+    invalid = c.post(url, headers={"Origin": ORIGIN}, data={"csrf": csrf, "pat": "not-a-token"})
+    assert invalid.status_code == 200 and "Token inválido" in invalid.text
+    denied = c.post(url, headers={"Origin": ORIGIN}, data={"csrf": csrf, "action": "deny"}, follow_redirects=False)
+    assert denied.status_code == 303 and "access_denied" in denied.headers["location"]
+    assert c.get(url).status_code == 400
+    assert tokens(c, reg)["access_token"].startswith("pmcp_a_")
 
 
-def test_jwt_verification_rejects_wrong_audience_issuer_and_expiration():
-    async def scenario():
-        private = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        public = (
-            private.public_key()
-            .public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
-            .decode()
-        )
-        verifier = JWTVerifier(public_key=public, issuer=ISSUER, audience=SETTINGS.client_id, algorithm="RS256")
-        claims = {"iss": ISSUER, "sub": "one", "aud": SETTINGS.client_id, "exp": int(time.time()) + 600}
-        assert await verifier.verify_token(jwt.encode(claims, private, algorithm="RS256"))
-        for change in [{"aud": "other"}, {"iss": "https://attacker.example"}, {"exp": 1}]:
-            assert await verifier.verify_token(jwt.encode(claims | change, private, algorithm="RS256")) is None
+def test_concurrent_exchange_is_single_use_and_pats_stay_encrypted(env):
+    c, p, _, _ = env
+    reg = register(c)
+    form = consent(c, reg)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        codes = list(pool.map(lambda _: c.post("/token", data=form).status_code, range(2)))
+    assert sorted(codes) == [200, 401]
 
-    run(scenario())
+    async def inspect():
+        for key in await p.vault.redis.keys("*"):
+            raw = await p.vault.redis.get(key)
+            assert PATS[0].encode() not in raw and form["code"].encode() not in key
 
-
-def test_portal_login_uses_pkce_nonce_and_secure_cookie():
-    portal = AccountPortal(SETTINGS, make_vault(), OIDC)
-    with TestClient(Starlette(routes=portal.routes()), base_url=ORIGIN) as client:
-        response = client.get("/mcp/account/login", follow_redirects=False)
-        query = parse_qs(urlsplit(response.headers["location"]).query)
-        assert query["code_challenge_method"] == ["S256"]
-        assert query["nonce"] and query["state"] and query["code_challenge"]
-        assert "HttpOnly" in response.headers["set-cookie"] and "Secure" in response.headers["set-cookie"]
-        assert response.headers["cache-control"] == "no-store"
-        assert client.get("/mcp/account/callback?state=wrong&code=x").status_code == 400
+    c.portal.call(inspect)
 
 
-def test_portal_requires_login_and_rejects_csrf_without_storing_pat():
-    vault = make_vault()
-    portal = AccountPortal(SETTINGS, vault, OIDC)
-    run(vault.put("session", "session-id", {"subject": "one", "csrf": "csrf-secret"}, 600))
-    with TestClient(Starlette(routes=portal.routes()), base_url=ORIGIN) as client:
-        assert client.get("/mcp/account", follow_redirects=False).status_code == 303
-        client.cookies.set(COOKIE, "session-id", domain="planner.example.com", path="/mcp/account")
-        response = client.post("/mcp/account", data={"pat": PAT, "csrf": "csrf-secret"})
-        assert response.status_code == 403
-        response = client.post("/mcp/account", data={"pat": PAT, "csrf": "wrong"}, headers={"Origin": ORIGIN})
-        assert response.status_code == 403
-        portal.validate_pat = AsyncMock(return_value={"pat": PAT, "user_id": "one", "email": "user@example.com"})
-        response = client.post("/mcp/account", data={"pat": PAT, "csrf": "csrf-secret"}, headers={"Origin": ORIGIN})
-        assert response.status_code == 200 and "Conta conectada" in response.text
-        assert PAT not in response.text
-        assert "frame-ancestors 'none'" in response.headers["content-security-policy"]
-        response = client.post(
-            "/mcp/account", data={"action": "disconnect", "csrf": "csrf-secret"}, headers={"Origin": ORIGIN}
-        )
-        assert "desvinculada" in response.text
-
-
-def test_portal_callback_nonce_and_replay_checks():
-    vault = make_vault()
-    portal = AccountPortal(SETTINGS, vault, OIDC)
-    run(vault.put("login", "state", {"nonce": "expected", "verifier": "verifier"}, 600))
-    oauth = AsyncMock()
-    oauth.__aenter__.return_value = oauth
-    oauth.fetch_token.return_value = {"id_token": "signed-token"}
-    portal.oauth_client = lambda: oauth
-    portal.verifier.verify_token = AsyncMock(return_value=token().model_copy(update={"claims": {"nonce": "wrong"}}))
-    with TestClient(Starlette(routes=portal.routes()), base_url=ORIGIN) as client:
-        client.cookies.set(COOKIE, "state", domain="planner.example.com", path="/mcp/account")
-        assert client.get("/mcp/account/callback?state=state&code=code").status_code == 400
-        assert client.get("/mcp/account/callback?state=state&code=code").status_code == 400
-        assert oauth.fetch_token.await_count == 1
-
-
-def test_discovery_pkce_and_legacy_pat_auth_share_one_endpoint(monkeypatch):
-    from plane_mcp.community.__main__ import build_app
-
-    monkeypatch.setattr("plane_mcp.community.__main__.build_token_store", lambda: MemoryStore())
-    monkeypatch.setattr("plane_mcp.community.__main__.Redis.from_url", lambda *a, **kw: FakeRedis())
-    with patch("fastmcp.server.auth.oidc_proxy.OIDCProxy.get_oidc_configuration", return_value=OIDC):
-        app = build_app(SETTINGS)
-    initialize = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}},
-    }
-    headers = {"Accept": "application/json, text/event-stream"}
-    with TestClient(app, base_url=ORIGIN) as client:
-        metadata = client.get("/.well-known/oauth-authorization-server").json()
-        assert metadata["code_challenge_methods_supported"] == ["S256"]
-        assert metadata["authorization_endpoint"] == ORIGIN + "/authorize"
-        resource = client.get("/.well-known/oauth-protected-resource/mcp").json()
-        assert resource["resource"] == ORIGIN + "/mcp"
-        assert client.post("/mcp", json=initialize, headers=headers).status_code == 401
-        registration = client.post(
-            "/register",
-            json={
-                "redirect_uris": ["http://127.0.0.1:8765/callback"],
-                "token_endpoint_auth_method": "none",
-                "grant_types": ["authorization_code", "refresh_token"],
-            },
-        )
-        assert registration.status_code == 201
-        response = client.get(
-            "/authorize",
-            params={
-                "client_id": registration.json()["client_id"],
-                "response_type": "code",
-                "redirect_uri": "http://127.0.0.1:8765/callback",
-                "state": "abc",
-            },
-            follow_redirects=False,
-        )
-        assert response.status_code == 302
-        error = parse_qs(urlsplit(response.headers["location"]).query)
-        assert error["error"] == ["invalid_request"]
-        assert "code_challenge" in error["error_description"][0]
-        with patch(
-            "plane_mcp.auth.plane_header_auth_provider.PlaneHeaderAuthProvider._validate_api_key",
-            new=AsyncMock(side_effect=lambda pat: pat == PAT),
-        ) as verify:
-            for value in [PAT, "Bearer " + PAT]:
-                response = client.post("/mcp", json=initialize, headers=headers | {"Authorization": value})
-                assert response.status_code == 200, response.text
-            before = verify.await_count
-            assert (
-                client.post("/mcp", json=initialize, headers=headers | {"Authorization": "Bearer bad-jwt"}).status_code
-                == 401
+def test_oauth_users_are_isolated_and_workspace_header_cannot_override(env):
+    c, _, _, _ = env
+    reg = register(c)
+    one = tokens(c, reg)
+    two = tokens(c, reg, PATS[1])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(
+            pool.map(
+                lambda t: result(rpc(c, t, "tools/call", None, **{"X-Workspace-Slug": "evil"})),
+                [one["access_token"], two["access_token"]],
             )
-            assert verify.await_count == before
-        response = client.post(
-            "/mcp", json=initialize, headers=[*headers.items(), ("Authorization", PAT), ("Authorization", PAT)]
         )
-        assert response.status_code == 400
+    assert responses == [{"user": "0", "workspace": "openmarkets"}, {"user": "1", "workspace": "openmarkets"}]
+    assert rpc(c, "pmcp_a_" + secrets.token_urlsafe(32)).status_code == 401
 
 
-def test_settings_reject_shared_credentials(monkeypatch):
-    monkeypatch.setenv("PLANE_API_KEY", PAT)
+def test_refresh_rotates_and_replay_revokes_only_its_family(env):
+    c, _, _, _ = env
+    reg = register(c)
+    one = tokens(c, reg)
+    two = tokens(c, reg, PATS[1])
+    renewed = refresh(c, reg, one["refresh_token"])
+    assert renewed.status_code == 200
+    renewed = renewed.json()
+    assert renewed["refresh_token"] != one["refresh_token"]
+    assert result(rpc(c, renewed["access_token"]))["user"] == "0"
+    assert refresh(c, reg, one["refresh_token"]).status_code == 401
+    assert rpc(c, renewed["access_token"]).status_code == 401
+    assert refresh(c, reg, renewed["refresh_token"]).status_code == 401
+    assert result(rpc(c, two["access_token"]))["user"] == "1"
+
+
+def test_revocation_public_confidential_and_cross_client_ownership(env):
+    c, _, _, _ = env
+    reg = register(c)
+    other = register(c)
+    issued = tokens(c, reg)
+    body = {"token": issued["refresh_token"], "token_type_hint": "refresh_token"}
+    assert c.post("/revoke", data=body | {"client_id": other["client_id"]}).status_code == 200
+    assert result(rpc(c, issued["access_token"]))["user"] == "0"
+    assert c.post("/revoke", data=body | {"client_id": reg["client_id"]}).status_code == 200
+    assert rpc(c, issued["access_token"]).status_code == 401
+    assert refresh(c, reg, issued["refresh_token"]).status_code == 401
+    confidential = register(c, token_endpoint_auth_method="client_secret_post")
+    body = {"client_id": confidential["client_id"], "token": "unknown-token"}
+    assert c.post("/revoke", data=body).status_code == 401
+    assert c.post("/revoke", data=body | {"client_secret": "wrong"}).status_code == 401
+    assert c.post("/revoke", data=body | {"client_secret": confidential["client_secret"]}).status_code == 200
+
+
+def test_revoked_pat_and_expired_grant_block_refresh(env):
+    c, p, users, _ = env
+    reg = register(c)
+    issued = tokens(c, reg)
+    users.pop(PATS[0])
+    assert refresh(c, reg, issued["refresh_token"]).status_code == 401
+    assert rpc(c, issued["access_token"]).status_code == 401
+    issued = tokens(c, reg, PATS[1])
+
+    async def expire():
+        data = await p.vault.get("access", issued["access_token"])
+        grant = await p.vault.get("grant", data["grant_id"])
+        grant["expires_at"] = int(time.time()) - 1
+        await p.vault.put("grant", data["grant_id"], grant, 60)
+
+    c.portal.call(expire)
+    assert rpc(c, issued["access_token"]).status_code == 401
+    assert refresh(c, reg, issued["refresh_token"]).status_code == 401
+
+
+def test_existing_pat_clients_raw_bearer_and_duplicate_headers(env):
+    c, _, _, _ = env
+    init = {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "legacy", "version": "1"}}
+    for auth in [PATS[0], "Bearer " + PATS[0]]:
+        r = c.post(
+            "/mcp",
+            headers={"Authorization": auth, "Accept": "application/json, text/event-stream"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": init},
+        )
+        assert r.status_code == 200
+    assert c.post("/mcp", headers=[("Authorization", PATS[0]), ("Authorization", PATS[1])]).status_code == 400
+
+
+def test_pat_validation_requires_user_and_workspace_access(monkeypatch):
+    monkeypatch.setenv("PLANE_INTERNAL_BASE_URL", "https://plane.internal")
+    original = httpx.AsyncClient
+    for status in [200, 403]:
+
+        def respond(request, status=status):
+            assert request.headers["X-Api-Key"] == PATS[0]
+            return (
+                httpx.Response(200, json={"id": "one"})
+                if request.url.path.endswith("/me/")
+                else httpx.Response(status, json={})
+            )
+
+        transport = httpx.MockTransport(respond)
+        monkeypatch.setattr(
+            "plane_mcp.community.auth.httpx.AsyncClient",
+            lambda transport=transport, **kwargs: original(transport=transport, **kwargs),
+        )
+        assert bool(asyncio.run(validate_pat(PATS[0], "openmarkets"))) == (status == 200)
+    assert asyncio.run(validate_pat("invalid", "openmarkets")) is None
+
+
+def test_replay_marking_is_atomic():
+    async def scenario():
+        vault = Vault(FakeRedis(), SETTINGS.encryption_key)
+        await vault.put("refresh", "token", {"grant_id": "grant", "client_id": "client"}, 60)
+        values = await asyncio.gather(*(vault.consume_refresh("token") for _ in range(5)))
+        assert sum(v is not None for v in values) == 1
+        assert (await vault.get("spent", "token"))["grant_id"] == "grant"
+
+    asyncio.run(scenario())
+
+
+def test_shared_plane_credential_is_rejected(monkeypatch):
+    monkeypatch.setenv("PLANE_API_KEY", PATS[0])
     with pytest.raises(ValueError, match="Shared"):
         Settings.from_env()
 
 
-def test_declining_oauth_does_not_permanently_block_the_client():
-    with patch("fastmcp.server.auth.oidc_proxy.OIDCProxy.get_oidc_configuration", return_value=OIDC):
-        provider = CommunityOIDCProxy(
-            config_url=SETTINGS.discovery_url,
-            client_id=SETTINGS.client_id,
-            client_secret=SETTINGS.client_secret,
-            base_url=ORIGIN,
-            client_storage=MemoryStore(),
-        )
-    request = SimpleNamespace(cookies={})
-    assert provider._decode_list_cookie(request, "MCP_DENIED_CLIENTS") == []
+def test_cimd_client_uses_the_same_pkce_consent_and_token_flow(env, monkeypatch):
+    from fastmcp.server.auth.cimd import CIMDDocument
+
+    c, provider, _, _ = env
+    client_id = "https://client.example/oauth-metadata.json"
+    document = CIMDDocument(
+        client_id=client_id,
+        client_name="Published client",
+        redirect_uris=[CALLBACK],
+        grant_types=["authorization_code", "refresh_token"],
+    )
+    monkeypatch.setattr(provider.cimd._fetcher, "fetch", AsyncMock(return_value=document))
+    issued = tokens(c, {"client_id": client_id})
+    assert result(rpc(c, issued["access_token"]))["user"] == "0"
+
+
+def test_auth_bodies_and_registration_abuse_are_bounded(env):
+    c, provider, _, _ = env
+    assert c.post("/register", content=b"x" * 32769).status_code == 413
+    c.portal.call(provider.vault.redis.set, "community-direct:rate:/register", 60)
+    assert c.post("/register", json={}).status_code == 429
+
+
+def test_expired_codes_and_other_clients_cannot_redeem_authorization(env):
+    c, provider, _, _ = env
+    reg, other = register(c), register(c)
+    form = consent(c, reg)
+    assert c.post("/token", data=form | {"client_id": other["client_id"]}).status_code == 401
+
+    async def expire():
+        data = await provider.vault.get("code", form["code"])
+        data["expires_at"] = time.time() - 1
+        await provider.vault.put("code", form["code"], data, 60)
+
+    c.portal.call(expire)
+    assert c.post("/token", data=form).status_code == 401

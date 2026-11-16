@@ -1,111 +1,117 @@
-# Plane Community: OAuth and personal tokens
+# Direct OAuth for Plane Community
 
-This fork adds an optional deployment adapter under `plane_mcp/community/`.
-The official source files, tools, package metadata, lockfile, and entry points are
-unchanged. Start the adapter with `python -m plane_mcp.community`.
+This optional adapter adds OAuth to the official MCP server without changing any
+existing upstream source file, tool, dependency, lockfile or entry point. Run it
+with `python -m plane_mcp.community`.
 
-The design is inspired by the Authentik/PAT bridge in
-[andreafio/plane-mcp-server](https://github.com/andreafio/plane-mcp-server), but uses
-FastMCP's `MultiAuth` to feed verified per-request credentials into the official
-tools without patching their client or middleware.
+## User experience
 
-## Architecture
+1. Add `https://planner.openmarkets.com.br/mcp` to Claude or Codex with OAuth/sign-in.
+2. The browser opens a consent page on the same domain. Check the application and
+   callback destination, then enter your personal Plane API token and authorize.
+3. The client receives separate OAuth credentials. Your Plane token never goes
+   into the client configuration, an MCP argument, a URL or the conversation.
 
-- FastMCP `OIDCProxy` owns MCP OAuth 2.1, PKCE S256, discovery, DCR/CIMD,
-  consent, encrypted upstream tokens, refresh and revocation.
-  The adapter retains Authentik's required `offline_access` scope on refresh,
-  including when a client requests only `openid`.
-- Authentik authenticates users with OIDC. Use RS256, a signing key, explicit
-  redirect URIs, 10-minute access/ID tokens, rotating refresh tokens and a
-  restricted application group. Enable passkeys/MFA in its authentication flow.
-- A separate authenticated account page links a user's Plane PAT. It uses
-  Authlib authorization code + PKCE, nonce verification, issuer/audience checking,
-  Secure/HttpOnly/SameSite cookies, CSRF checks, and atomic single-use login state.
-- The identity key is a SHA-256 digest of the verified `[issuer, subject]` pair.
-  Plane validates the submitted PAT and membership before it is stored.
-- PATs, portal sessions and login state are Fernet-encrypted in dedicated Redis.
-  The encryption and signing keys must be backed up separately from Redis.
-- Each authenticated MCP request gets its own copy of the upstream API-key
-  context. No global Plane token is configured. The Plane API remains the source
-  of truth for workspace/project permissions, token expiration and revocation.
-- Unlinked OAuth users can discover tools and call `identity`, but cannot run
-  Plane tools. The `identity` tool never takes or returns a credential.
-- Legacy `Authorization: Bearer plane_api_...` and raw PAT headers remain supported
-  on `/mcp`; missing workspace headers use the configured default. OAuth workspace
-  selection comes from configuration, never from an untrusted request header.
+There is no separate account, password, identity provider or MFA enrollment.
+Possession of a valid personal Plane token proves access. The Plane API remains
+responsible for workspace and project permissions. Prefer a dedicated personal
+API token for MCP, so revoking it in Plane disconnects all its MCP authorizations.
 
-## Configuration
+Existing clients using `Authorization: Bearer plane_api_...` or the raw PAT keep
+working on the same `/mcp` URL. A missing workspace header uses the configured
+workspace. OAuth always uses the configured workspace, regardless of headers.
 
-Required environment variables:
+## Architecture and security
 
-| Variable | Meaning |
+- FastMCP/MCP SDK handlers handle discovery, registration, client authentication,
+  redirect validation and Authorization Code + PKCE S256 verification. FastMCP's
+  CIMD manager handles published client identities, SSRF-safe metadata retrieval
+  and private-key client assertions. Redirects also use the official allowlist.
+- The adapter supplies consent and encrypted authorization records. It uses
+  random 256-bit opaque codes/tokens, not a custom JWT signing scheme.
+- Consent expires after five minutes. Secure/HttpOnly/SameSite cookies, exact
+  Origin and CSRF checks, no-store/no-referrer headers and frame restrictions
+  protect the form. Users see both the requesting application and its callback.
+- Authorization codes expire after 60 seconds. Atomic consumption prevents
+  concurrent reuse after the SDK checks PKCE, client and redirect URI.
+- Access tokens last at most ten minutes. Grants expire after seven days; refresh
+  cannot extend that absolute limit. Refresh revalidates access in Plane.
+- Refresh tokens rotate atomically. Reuse of an old refresh token revokes its
+  entire authorization family. Separate users and connections remain unaffected.
+- Revoking an access or refresh token deletes that authorization family. Every
+  request checks the grant, so revocation blocks subsequent requests immediately.
+  Requests already in flight can finish. Revoking the PAT in Plane also blocks
+  subsequent Plane API operations and refresh, including direct PAT clients.
+- Redis stores SHA-256 identifiers and Fernet-encrypted records. PATs and OAuth
+  bearer tokens are never stored as plaintext Redis keys. A verified PAT is placed
+  only in the official server's request-local context, never issued to a client.
+- Global auth budgets for this small deployment: 60 client registrations/hour,
+  120 authorization requests/minute, 120 consent requests/minute and 300 token or
+  revocation requests/minute. Auth bodies are capped at 32 KiB. MCP tool calls are
+  unaffected. Client registrations expire after seven days and can be renewed by
+  registering again. There are no public database or Redis ports.
+
+The locked SDK incorrectly requires a nullable `client_secret` form field at
+revocation. The adapter supplies an empty field when omitted, while retaining
+client authentication and token ownership checks. This is covered for public
+and confidential clients.
+
+## Deployment
+
+Only the MCP container and a dedicated persistent Redis are required, alongside
+the existing Plane and HTTPS proxy. Examples: `deploy/community/`.
+
+Required configuration:
+
+| Variable | Value |
 |---|---|
-| COMMUNITY_PUBLIC_URL | HTTPS origin, e.g. `https://planner.example.com` |
-| COMMUNITY_OIDC_DISCOVERY_URL | Trusted Authentik discovery URL |
-| COMMUNITY_OIDC_CLIENT_ID / COMMUNITY_OIDC_CLIENT_SECRET | Confidential OIDC application |
-| COMMUNITY_ENCRYPTION_KEY | Fernet key, retained across deployments |
-| COMMUNITY_SIGNING_KEY | Independent random signing secret (32+ characters) |
-| REDIS_URL | Dedicated persistent Redis connection |
-| MCP_DEFAULT_WORKSPACE_SLUG | Workspace the OAuth connection uses |
+| COMMUNITY_PUBLIC_URL | HTTPS origin, e.g. `https://planner.openmarkets.com.br` |
+| COMMUNITY_ENCRYPTION_KEY | A Fernet key retained across deployments |
+| REDIS_URL | Private persistent Redis URL (the Compose file constructs it) |
+| MCP_DEFAULT_WORKSPACE_SLUG | `openmarkets` |
 | PLANE_BASE_URL | Public Plane origin |
-| PLANE_INTERNAL_BASE_URL | Internal trusted Plane API origin |
+| PLANE_INTERNAL_BASE_URL | Trusted internal Plane API origin |
 
-Register these exact Authentik callback URLs:
+Compose additionally requires `MCP_IMAGE` and `REDIS_PASSWORD`. Build from the
+frozen official lockfile; deploy a pinned image. Never configure a global
+`PLANE_API_KEY` or `PLANE_ACCESS_TOKEN`: the adapter rejects shared credentials.
+Keep environment files outside Git with permissions 0600.
 
-- `https://planner.example.com/mcp/oauth/callback` (MCP OAuth proxy)
-- `https://planner.example.com/mcp/account/callback` (account-link page)
-
-Include the `openid`, `profile`, `email` and `offline_access` scope mappings.
-The issuer, audience and signature algorithm are verified. Both callbacks use
-PKCE; client authentication uses `client_secret_post` over HTTPS.
-
-Route these paths to the adapter, without stripping their prefixes:
+Proxy these paths without stripping prefixes:
 
 - `/mcp` and `/mcp/*`
 - `/.well-known/oauth-authorization-server`
 - `/.well-known/oauth-protected-resource` and its `/mcp` variant
-- `/authorize`, `/token`, `/register`, `/revoke`, `/consent`
+- `/authorize`, `/token`, `/register`, `/revoke`
 
-Docker examples are in `deploy/community/`. They publish no database or Redis
-ports and do not mount the Docker socket into Authentik. Use the existing HTTPS
-proxy and pin image versions/digests. The MCP image installs `uv.lock` frozen.
-Keep environment files outside the repository with mode 0600.
+`/mcp/account` only explains how to start authorization from the MCP client; it
+has no login or credential form. The consent page requires a valid authorization
+request from the client.
 
-## User setup
+Back up Redis and the encryption key, storing the key separately. Losing either
+requires users to authorize again. There is no identity-provider database to
+maintain. Changing the key invalidates existing records.
 
-1. The administrator creates your Authentik account and grants application access.
-2. Open `https://planner.example.com/mcp/account` and sign in.
-3. Generate a personal API token in Plane and link it in that page. It never goes
-   into a chat, MCP tool argument, URL, repository or application log.
-4. Add `https://planner.example.com/mcp` to your MCP client with OAuth/sign-in.
-5. To disconnect, use the account page. To invalidate the PAT everywhere, revoke
-   it in Plane as well. Unlinking affects OAuth; direct PAT clients remain valid
-   until Plane revokes or expires their token.
+## Synchronizing the fork
 
-Auth sessions may remain valid until the short access-token lifetime expires when
-an identity is disabled at the IdP. Removing the Plane membership/PAT or deleting
-the adapter binding blocks subsequent Plane operations independently. Existing
-in-flight calls can finish. Both Redis persistence and encryption keys are needed
-to retain links across restarts. Portal sessions expire after ten minutes.
+Run `bash scripts/community-sync.sh` from a clean checkout. It fetches official
+`main`, creates a `codex/upstream-...` review branch from the fork's `main`, merges,
+runs lint and the complete upstream + adapter tests, then opens a PR. It never
+resets the fork, force-pushes or deploys. Conflicts stop the script.
 
-## Updating from the official repository
-
-Run `bash scripts/community-sync.sh` from a clean checkout. It fetches the official
-`main`, creates a `codex/upstream-...` branch from the fork's `main`, merges, runs
-the full test suite, then opens a pull request. Conflicts stop the script; it never
-resets the fork, force-pushes, or deploys. Review and merge the PR, then build a new
-image and validate before rollout. The GitHub `Community OAuth checks` workflow
-also runs on PRs and pushes.
-
-Keep new integration code in the adapter directory. Updates to FastMCP may still
-require adapter changes: isolated files avoid textual conflicts, while integration
-tests catch behavioral changes. Do not use a destructive mirror/reset operation
-to synchronize the customized main branch.
+Keep the adapter separate. Dependency or behavior changes upstream can still
+require adaptation; isolated files avoid textual conflicts, while tests detect
+compatibility regressions. Build and validate a new image before changing the
+running deployment.
 
 ## Validation and rollback
 
-`uv sync --frozen --extra dev && uv run --frozen --extra dev pytest -q` runs upstream tests and
-adapter security/compatibility tests. Before promotion, exercise real OAuth with
-two separate users, wrong/missing PKCE, refresh, unlink/revocation, persistence,
-and legacy PAT clients. Keep the previous MCP container/config available and
-switch only the proxy route after validation; rollback is a proxy reload.
+Run `uv sync --frozen --extra dev` and `uv run --frozen --extra dev pytest -q`.
+Tests exercise the actual OAuth handlers: PKCE, CSRF, resource/client/redirect
+binding, expiry, concurrent code exchange, encryption, refresh rotation/replay,
+revocation, per-user context, CIMD and legacy PAT compatibility.
+
+Before deployment, validate real Plane permissions and CRUD with temporary
+accounts, restart Redis/MCP to check persistence, and test public HTTPS. Keep the
+previous image and proxy configuration until these checks pass. Roll back by
+restoring the previous image/configuration; retain the Redis volume and key.
