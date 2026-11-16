@@ -1,0 +1,24 @@
+name: Community OAuth checks
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.13.5'
+      - run: uv sync --frozen --extra dev
+      - run: uv run --frozen --extra dev ruff check plane_mcp/community tests/community
+      - run: uv run --frozen --extra dev ruff format --check plane_mcp/community tests/community
+      - run: uv run --frozen --extra dev pytest -q
