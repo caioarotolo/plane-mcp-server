@@ -142,3 +142,18 @@ Before deployment, validate real Plane permissions and CRUD with temporary
 accounts, restart Redis/MCP to check persistence, and test public HTTPS. Keep the
 previous image and proxy configuration until these checks pass. Roll back by
 restoring the previous image/configuration; retain the Redis volume and key.
+
+## Automatic deployment on this fork
+
+`main` pushes (including merges and upstream synchronization) run tests, lint,
+format checks and a GHCR image build, then deploy to the VPS automatically. PRs
+validate without deployment credentials. The production job uses a dedicated
+restricted SSH key and a pinned host key; only its exact commit can be deployed.
+The VPS resolves the image to its digest, retains Redis and the encryption key,
+and restores the old image if the new container fails its health check.
+
+The active image is in `release.compose.json`; use
+`/home/caio/plane-mcp-oauth/mcp.sh` for manual Compose operations so the overlay is
+included. Shared receiver setup, branch restrictions, deployment locking and
+recovery are documented in the app fork's
+[`deployments/openmarkets/README.md`](https://github.com/caioarotolo/plane/blob/preview/deployments/openmarkets/README.md).
