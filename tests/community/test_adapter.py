@@ -208,6 +208,7 @@ def test_consent_csrf_cookie_origin_and_denial(env):
     assert "Secure" in page.headers["set-cookie"] and "HttpOnly" in page.headers["set-cookie"]
     assert (
         page.headers["cache-control"] == "no-store"
+        and page.headers["referrer-policy"] == "same-origin"
         and "frame-ancestors 'none'" in page.headers["content-security-policy"]
     )
     csrf = re.search('name="csrf" value="([^"]+)"', page.text).group(1)

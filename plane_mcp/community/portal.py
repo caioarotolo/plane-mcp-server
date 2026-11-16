@@ -18,7 +18,7 @@ COOKIE = "__Secure-plane-mcp-consent"
 PATH = "/mcp/authorize"
 HEADERS = {
     "Cache-Control": "no-store",
-    "Referrer-Policy": "no-referrer",
+    "Referrer-Policy": "same-origin",
     "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'",
 }

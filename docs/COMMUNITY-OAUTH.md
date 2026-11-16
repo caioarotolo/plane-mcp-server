@@ -38,7 +38,7 @@ workspace. OAuth always uses the configured workspace, regardless of headers.
 - The adapter supplies consent and encrypted authorization records. It uses
   random 256-bit opaque codes/tokens, not a custom JWT signing scheme.
 - Consent expires after five minutes. Secure/HttpOnly/SameSite cookies, exact
-  Origin and CSRF checks, no-store/no-referrer headers and frame restrictions
+  Origin and CSRF checks, no-store, same-origin referrer policy and frame restrictions
   protect the form. Users see both the requesting application and its callback.
 - Authorization codes expire after 60 seconds. Atomic consumption prevents
   concurrent reuse after the SDK checks PKCE, client and redirect URI.
