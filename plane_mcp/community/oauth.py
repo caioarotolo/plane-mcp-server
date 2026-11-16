@@ -1,4 +1,4 @@
-"""Direct authorization using a personal Plane token; no external identity server."""
+"""OAuth grants for Plane Community; no external identity server."""
 
 import secrets
 import time

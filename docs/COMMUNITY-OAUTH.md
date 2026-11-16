@@ -7,15 +7,23 @@ with `python -m plane_mcp.community`.
 ## User experience
 
 1. Add `https://planner.openmarkets.com.br/mcp` to Claude or Codex with OAuth/sign-in.
-2. The browser opens a consent page on the same domain. Check the application and
-   callback destination, then enter your personal Plane API token and authorize.
-3. The client receives separate OAuth credentials. Your Plane token never goes
-   into the client configuration, an MCP argument, a URL or the conversation.
+2. The browser opens Plane's own login if you are not already signed in.
+3. Check your account, the requesting application and callback destination, then
+   click **Authorize**. No API token copying or separate account is required.
+4. The adapter creates a dedicated, expiring Plane API token through the ordinary
+   user API and keeps it encrypted. The MCP client receives separate OAuth tokens.
 
-There is no separate account, password, identity provider or MFA enrollment.
-Possession of a valid personal Plane token proves access. The Plane API remains
-responsible for workspace and project permissions. Prefer a dedicated personal
-API token for MCP, so revoking it in Plane disconnects all its MCP authorizations.
+Plane must share the adapter's HTTPS origin and use its default `session-id`
+cookie. Only that session cookie and `csrftoken` are forwarded to the configured
+trusted Plane backend. Browser sessions and passwords are never persisted by the
+adapter or sent to the MCP client. It verifies the current user and workspace
+membership again when consent is submitted, and rejects an account switch.
+
+The generated credential is named `MCP OAuth · <client name>` in Plane's API
+settings. It expires after seven days, together with the OAuth grant. Deleting it
+in Plane disconnects that authorization. It is created only after explicit
+consent; visiting or cancelling the page creates no credential. Token ownership,
+expiry and workspace access are verified before issuing an OAuth code.
 
 Existing clients using `Authorization: Bearer plane_api_...` or the raw PAT keep
 working on the same `/mcp` URL. A missing workspace header uses the configured
@@ -42,6 +50,9 @@ workspace. OAuth always uses the configured workspace, regardless of headers.
   request checks the grant, so revocation blocks subsequent requests immediately.
   Requests already in flight can finish. Revoking the PAT in Plane also blocks
   subsequent Plane API operations and refresh, including direct PAT clients.
+  OAuth revocation deletes the encrypted credential from the grant immediately;
+  its now-inaccessible backing token remains listed in Plane until removed there
+  and expires within seven days. No browser session is retained for later cleanup.
 - Redis stores SHA-256 identifiers and Fernet-encrypted records. PATs and OAuth
   bearer tokens are never stored as plaintext Redis keys. A verified PAT is placed
   only in the official server's request-local context, never issued to a client.
@@ -84,6 +95,21 @@ Proxy these paths without stripping prefixes:
 - `/.well-known/oauth-protected-resource` and its `/mcp` variant
 - `/authorize`, `/token`, `/register`, `/revoke`
 
+Plane's SPA router cannot render the adapter's page. On the existing `/auth/*`
+proxy route, rewrite only a successful login redirect for our exact consent path
+into a document redirect. Example Caddy configuration for this deployment:
+
+```caddy
+reverse_proxy /auth/* api:8000 {
+    header_down Location "^https://planner[.]openmarkets[.]com[.]br/[?]next_path=(/mcp/authorize[?]request=[A-Za-z0-9_-]{43})$" "$1"
+}
+```
+
+Use your exact public hostname. Error redirects and all other Plane logins remain
+unchanged. The consent endpoint validates the session and authorization request
+again; the redirect itself grants no access. This proxy rule replaces no Plane
+source and must be retained when upgrading the proxy configuration.
+
 `/mcp/account` only explains how to start authorization from the MCP client; it
 has no login or credential form. The consent page requires a valid authorization
 request from the client.
@@ -109,7 +135,8 @@ running deployment.
 Run `uv sync --frozen --extra dev` and `uv run --frozen --extra dev pytest -q`.
 Tests exercise the actual OAuth handlers: PKCE, CSRF, resource/client/redirect
 binding, expiry, concurrent code exchange, encryption, refresh rotation/replay,
-revocation, per-user context, CIMD and legacy PAT compatibility.
+revocation, per-user context, CIMD, Plane session/consent binding, credential
+ownership/expiry and legacy PAT compatibility.
 
 Before deployment, validate real Plane permissions and CRUD with temporary
 accounts, restart Redis/MCP to check persistence, and test public HTTPS. Keep the

@@ -8,18 +8,22 @@ import re
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlsplit
+from uuid import uuid4
 
 import httpx
 import pytest
 from cryptography.fernet import Fernet
 from fakeredis.aioredis import FakeRedis
 from fastmcp.server.dependencies import get_access_token
+from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from plane_mcp.community.auth import validate_pat
 from plane_mcp.community.oauth import DirectOAuth
+from plane_mcp.community.session import create_credential, session_identity
 from plane_mcp.community.settings import Settings
 from plane_mcp.community.store import Vault
 
@@ -38,7 +42,16 @@ def env(monkeypatch):
     provider = DirectOAuth(SETTINGS, vault)
     users = {pat: {"pat": pat, "user_id": str(i), "email": f"user{i}@example.invalid"} for i, pat in enumerate(PATS)}
     check = AsyncMock(side_effect=lambda pat, workspace: users.get(pat))
-    monkeypatch.setattr("plane_mcp.community.portal.validate_pat", check)
+
+    async def who(request, settings):
+        user = users.get(request.cookies.get("session-id"))
+        return {k: v for k, v in user.items() if k != "pat"} if user else None
+
+    async def mint(request, settings, identity, name, expires):
+        return users[request.cookies["session-id"]]
+
+    monkeypatch.setattr("plane_mcp.community.portal.session_identity", who)
+    monkeypatch.setattr("plane_mcp.community.portal.create_credential", AsyncMock(side_effect=mint))
     monkeypatch.setattr("plane_mcp.community.oauth.validate_pat", check)
     monkeypatch.setattr(entry.Redis, "from_url", lambda *a, **kw: redis)
     monkeypatch.setattr(entry, "DirectOAuth", lambda *a: provider)
@@ -62,6 +75,7 @@ def env(monkeypatch):
     monkeypatch.setattr(entry, "get_header_mcp", factory)
     app = entry.build_app(SETTINGS)
     with TestClient(app, base_url=ORIGIN) as client:
+        client.cookies.set("session-id", PATS[0])
         yield client, provider, users, app
 
 
@@ -99,14 +113,13 @@ def begin(client, registration, **changes):
 
 
 def consent(client, registration, pat=PATS[0]):
+    client.cookies.set("session-id", pat)
     r, verifier = begin(client, registration)
     assert r.status_code == 302
     url = r.headers["location"]
     page = client.get(url)
     csrf = re.search('name="csrf" value="([^"]+)"', page.text).group(1)
-    r = client.post(
-        url, data={"csrf": csrf, "pat": pat, "action": "allow"}, headers={"Origin": ORIGIN}, follow_redirects=False
-    )
+    r = client.post(url, data={"csrf": csrf, "action": "allow"}, headers={"Origin": ORIGIN}, follow_redirects=False)
     assert r.status_code == 303, r.text
     assert pat not in r.text and pat not in r.headers["location"]
     query = parse_qs(urlsplit(r.headers["location"]).query)
@@ -204,12 +217,13 @@ def test_consent_csrf_cookie_origin_and_denial(env):
     ]:
         assert c.post(url, headers=headers, data=body | {"pat": PATS[0]}).status_code == 403
     cookies = list(c.cookies.jar)
-    c.cookies.clear()
+    c.cookies.delete("__Secure-plane-mcp-consent")
     assert c.post(url, headers={"Origin": ORIGIN}, data={"csrf": csrf, "pat": PATS[0]}).status_code == 403
     for cookie in cookies:
         c.cookies.jar.set_cookie(cookie)
-    invalid = c.post(url, headers={"Origin": ORIGIN}, data={"csrf": csrf, "pat": "not-a-token"})
-    assert invalid.status_code == 200 and "Token inválido" in invalid.text
+    c.cookies.set("session-id", PATS[1])
+    assert c.post(url, headers={"Origin": ORIGIN}, data={"csrf": csrf, "action": "allow"}).status_code == 403
+    c.cookies.set("session-id", PATS[0])
     denied = c.post(url, headers={"Origin": ORIGIN}, data={"csrf": csrf, "action": "deny"}, follow_redirects=False)
     assert denied.status_code == 303 and "access_denied" in denied.headers["location"]
     assert c.get(url).status_code == 400
@@ -390,3 +404,105 @@ def test_expired_codes_and_other_clients_cannot_redeem_authorization(env):
 
     c.portal.call(expire)
     assert c.post("/token", data=form).status_code == 401
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+def request():
+    return Request(
+        {
+            "type": "http",
+            "headers": [
+                (b"cookie", b"session-id=browser-session; csrftoken=csrf; other=do-not-forward"),
+                (b"authorization", b"Bearer do-not-forward"),
+                (b"host", b"attacker.invalid"),
+            ],
+        }
+    )
+
+
+@pytest.mark.anyio
+async def test_session_uses_only_trusted_backend_and_owned_expiring_credential(monkeypatch):
+    calls = []
+    expiry = int(time.time()) + 600
+
+    def handler(req):
+        calls.append(req)
+        assert req.url.host == "plane-internal" and req.headers["host"] == "planner.example.com"
+        assert req.headers["origin"] == ORIGIN and req.headers["x-csrftoken"] == "csrf"
+        assert "authorization" not in req.headers and "do-not-forward" not in str(req.headers)
+        if req.url.path == "/api/users/me/":
+            return httpx.Response(200, json={"id": "user-1", "email": "test@example.invalid"})
+        if req.url.path == "/api/users/me/workspaces/":
+            return httpx.Response(200, json=[{"slug": "openmarkets"}])
+        assert req.method == "POST" and req.url.path == "/api/users/api-tokens/"
+        body = json.loads(req.content)
+        assert body["label"] == "MCP OAuth · Claude" and "user" not in body
+        assert datetime.fromisoformat(body["expired_at"]).timestamp() == expiry
+        return httpx.Response(201, json={"id": str(uuid4()), "user": "user-1", "token": PATS[0], **body})
+
+    factory = httpx.AsyncClient
+    monkeypatch.setenv("PLANE_INTERNAL_BASE_URL", "http://plane-internal")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: factory(transport=httpx.MockTransport(handler), **kw))
+    identity = await session_identity(request(), SETTINGS)
+    assert identity == {"user_id": "user-1", "email": "test@example.invalid"}
+    monkeypatch.setattr("plane_mcp.community.session.validate_pat", AsyncMock(return_value=identity | {"pat": PATS[0]}))
+    assert await create_credential(request(), SETTINGS, identity, "Claude", expiry) == identity | {"pat": PATS[0]}
+    assert len(calls) == 3
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["expired_at", "user", "validation"])
+async def test_bad_generated_credential_is_removed(monkeypatch, failure):
+    expiry, token_id = int(time.time()) + 600, str(uuid4())
+    deleted = []
+
+    def handler(req):
+        if req.method == "DELETE":
+            assert req.url.path == f"/api/users/api-tokens/{token_id}/"
+            deleted.append(True)
+            return httpx.Response(204)
+        data = {
+            "id": token_id,
+            "user": "user-1",
+            "token": PATS[0],
+            "expired_at": datetime.fromtimestamp(expiry, timezone.utc).isoformat(),
+        }
+        if failure != "validation":
+            data[failure] = None if failure == "expired_at" else "another-user"
+        return httpx.Response(201, json=data)
+
+    factory = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: factory(transport=httpx.MockTransport(handler), **kw))
+    monkeypatch.setattr("plane_mcp.community.session.validate_pat", AsyncMock(return_value=None))
+    with pytest.raises((TypeError, ValueError)):
+        await create_credential(request(), SETTINGS, {"user_id": "user-1"}, "Claude", expiry)
+    assert deleted == [True]
+
+
+def test_login_redirect_expired_session_and_no_token_field(env, monkeypatch):
+    c, _, _, _ = env
+    mint = AsyncMock()
+    monkeypatch.setattr("plane_mcp.community.portal.create_credential", mint)
+    reg = register(c)
+    r, _ = begin(c, reg)
+    url = r.headers["location"]
+    c.cookies.clear()
+    r = c.get(url, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"].startswith(ORIGIN + "/?next_path=%2Fmcp%2Fauthorize")
+    assert c.post(url, data={"action": "allow"}, headers={"Origin": ORIGIN}).status_code == 401
+    c.cookies.set("session-id", PATS[0])
+    page = c.get(url)
+    assert page.status_code == 200 and 'name="pat"' not in page.text
+    assert "user0@example.invalid" in page.text and "Autorizar" in page.text
+    mint.assert_not_called()
+
+
+def test_no_workspace_access_blocks_consent(env, monkeypatch):
+    c, _, _, _ = env
+    monkeypatch.setattr("plane_mcp.community.portal.session_identity", AsyncMock(side_effect=PermissionError))
+    r, _ = begin(c, register(c))
+    assert c.get(r.headers["location"]).status_code == 403
