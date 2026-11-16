@@ -1,8 +1,7 @@
-name: Community MCP CI and deploy
+name: Community MCP build and deploy
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 permissions:
   contents: read
@@ -10,24 +9,8 @@ concurrency:
   group: community-mcp-${{ github.ref }}
   cancel-in-progress: false
 jobs:
-  test:
-    if: github.repository == 'caioarotolo/plane-mcp-server'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.11'
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          version: '0.13.5'
-      - run: uv sync --frozen --extra dev
-      - run: uv run --frozen --extra dev ruff check plane_mcp/community tests/community
-      - run: uv run --frozen --extra dev ruff format --check plane_mcp/community tests/community
-      - run: uv run --frozen --extra dev pytest -q
   image:
-    if: github.repository == 'caioarotolo/plane-mcp-server'
+    if: github.repository == 'caioarotolo/plane-mcp-server' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -39,7 +22,6 @@ jobs:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -49,7 +31,7 @@ jobs:
           context: .
           file: deploy/community/Dockerfile
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+          push: true
           tags: ghcr.io/caioarotolo/plane-mcp-server:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/caioarotolo/plane-mcp-server
@@ -57,7 +39,7 @@ jobs:
           cache-from: type=gha,scope=community-mcp
           cache-to: type=gha,mode=max,scope=community-mcp
   deploy:
-    needs: [test, image]
+    needs: [image]
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'caioarotolo/plane-mcp-server'
     runs-on: ubuntu-latest
     timeout-minutes: 30

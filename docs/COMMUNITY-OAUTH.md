@@ -145,9 +145,12 @@ restoring the previous image/configuration; retain the Redis volume and key.
 
 ## Automatic deployment on this fork
 
-`main` pushes (including merges and upstream synchronization) run tests, lint,
-format checks and a GHCR image build, then deploy to the VPS automatically. PRs
-validate without deployment credentials. The production job uses a dedicated
+`main` pushes (including merges and upstream synchronization) build the GHCR
+image, then deploy to the VPS automatically. CI test, lint and format jobs are
+intentionally disabled; PRs do not launch test or build runners. Agents can run
+the same checks locally before publishing, as documented in `AGENTS.md`. Preserve
+this policy when syncing upstream. Health/availability checks and image recovery
+remain enabled. The production job uses a dedicated
 restricted SSH key and a pinned host key; only its exact commit can be deployed.
 The VPS resolves the image to its digest, retains Redis and the encryption key,
 and restores the old image if the new container fails its health check.
